@@ -37,23 +37,32 @@ const makeDebuggee = (
     /** The guest is still loading its first page. */
     readonly loading?: boolean;
     readonly refuse?: (method: string, sessionId: string | undefined) => boolean;
+    /** The page's animations settle only when the test says so. */
+    readonly deferAnimations?: boolean;
   } = {},
 ) => {
   const emitter = new NodeEvents.EventEmitter();
   const pending: Array<() => void> = [];
   const focusChanges: Array<() => void> = [];
+  const animations: Array<() => void> = [];
   const sent: Array<unknown> = [];
   const sendWaiters: Array<() => void> = [];
   const focusEmulation: Array<boolean> = [];
   const debuggee = Object.assign(emitter, {
     sendCommand: (
       method: string,
-      params?: { id?: number; enabled?: boolean },
+      params?: { id?: number; enabled?: boolean; expression?: string },
       sessionId?: string,
     ) =>
       new Promise((resolve, reject) => {
         if (options.refuse?.(method, sessionId)) {
           reject(new Error("Refused"));
+          return;
+        }
+        // The host's own evaluation, waiting on the page's animations before a screenshot.
+        if (method === "Runtime.evaluate" && params?.expression !== undefined) {
+          if (options.deferAnimations) animations.push(() => resolve({ result: {} }));
+          else resolve({ result: {} });
           return;
         }
         if (method === "Target.getTargetInfo") {
@@ -99,6 +108,7 @@ const makeDebuggee = (
     release: () => pending.splice(0).forEach((resolve) => resolve()),
     releaseFirst: () => pending.shift()?.(),
     settleFocus: () => focusChanges.splice(0).forEach((resolve) => resolve()),
+    settleAnimations: () => animations.splice(0).forEach((resolve) => resolve()),
   };
 };
 
@@ -295,12 +305,14 @@ describe("DesktopBrowserHost", () => {
 
       yield* command(host, 1, "Page.captureScreenshot");
       yield* command(host, 2, "Page.captureScreenshot");
+      yield* settle;
       yield* command(host, 3, "DOM.enable");
       yield* settle;
       expect(debuggee.sent).toEqual([1, 3]);
 
       debuggee.releaseFirst();
       expect(yield* Queue.take(replies)).toBe(1);
+      yield* settle;
       expect(debuggee.sent).toEqual([1, 3, 2]);
     }).pipe(Effect.scoped),
   );
@@ -317,15 +329,18 @@ describe("DesktopBrowserHost", () => {
       yield* command(host, 3, "Page.captureScreenshot");
       yield* settle;
       debuggee.navigate();
+      yield* settle;
       expect(debuggee.sent).toEqual([1, 2]);
 
       // The superseded screenshot answering late must not start a third beside the second.
       debuggee.releaseFirst();
       expect(yield* Queue.take(replies)).toBe(1);
+      yield* settle;
       expect(debuggee.sent).toEqual([1, 2]);
 
       debuggee.releaseFirst();
       expect(yield* Queue.take(replies)).toBe(2);
+      yield* settle;
       expect(debuggee.sent).toEqual([1, 2, 3]);
     }).pipe(Effect.scoped),
   );
@@ -434,6 +449,7 @@ describe("DesktopBrowserHost", () => {
       yield* command(host, 2, "Page.captureScreenshot");
       yield* settle;
       debuggee.navigate();
+      yield* settle;
       expect(debuggee.sent).toEqual([1, 2]);
       yield* TestClock.adjust("1 minute");
       expect(debuggee.focusEmulation).toEqual([true]);
@@ -962,6 +978,36 @@ describe("DesktopBrowserHost", () => {
       yield* settle;
       expect(painting).toEqual([true, false]);
     }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "captures a painted guest once its finite animations settle, waiting at most 500ms",
+    () =>
+      Effect.gen(function* () {
+        const host = yield* DesktopBrowserHost.make;
+        const debuggee = makeDebuggee({ deferAnimations: true });
+        host.attach(key, debuggee.tab);
+        const painting = yield* watchPainting(host);
+
+        // A hidden guest starts its compositor animations only once it is painted.
+        yield* command(host, 1, "Page.captureScreenshot");
+        yield* settle;
+        expect(painting).toEqual([true]);
+        expect(debuggee.sent).toEqual([]);
+        debuggee.settleAnimations();
+        yield* settle;
+        expect(debuggee.sent).toEqual([1]);
+        debuggee.release();
+        yield* settle;
+
+        yield* command(host, 2, "Page.captureScreenshot");
+        yield* settle;
+        yield* TestClock.adjust("499 millis");
+        expect(debuggee.sent).toEqual([1]);
+        yield* TestClock.adjust("1 millis");
+        yield* settle;
+        expect(debuggee.sent).toEqual([1, 2]);
+      }).pipe(Effect.scoped),
   );
 
   it.effect("stops painting for a screenshot Chromium never answers once its document goes", () =>
